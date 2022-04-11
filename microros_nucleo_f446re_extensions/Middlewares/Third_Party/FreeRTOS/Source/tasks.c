@@ -40,6 +40,8 @@ task.h is included from an application file. */
 #include "timers.h"
 #include "stack_macros.h"
 
+#include "custom.h"
+
 /* Lint e9021, e961 and e750 are suppressed as a MISRA exception justified
 because the MPU ports require MPU_WRAPPERS_INCLUDED_FROM_API_FILE to be defined
 for the header files above, but not in this file, in order to generate the
@@ -213,13 +215,28 @@ count overflows. */
 
 /*
  * Place the task represented by pxTCB into the appropriate ready list for
- * the task.  It is inserted at the end of the list.
+ * the task.
+ * Fixed Priority - It is inserted at the end of the list.
+ * Dynamic Priority - It is inserted by key into the list.
+ * 					  The key must be the factor deciding the priority.
  */
-#define prvAddTaskToReadyList( pxTCB )																\
-	traceMOVED_TASK_TO_READY_STATE( pxTCB );														\
-	taskRECORD_READY_PRIORITY( ( pxTCB )->uxPriority );												\
-	vListInsertEnd( &( pxReadyTasksLists[ ( pxTCB )->uxPriority ] ), &( ( pxTCB )->xStateListItem ) ); \
-	tracePOST_MOVED_TASK_TO_READY_STATE( pxTCB )
+#if ( configUSE_EDF_SCHEDULER == 0 )
+    #define prvAddTaskToReadyList( pxTCB )                                                                      \
+    {                                                                                                           \
+        traceMOVED_TASK_TO_READY_STATE( pxTCB );                                                                \
+        taskRECORD_READY_PRIORITY( ( pxTCB )->uxPriority );                                                     \
+        vListInsertEnd( &( pxReadyTasksLists[ ( pxTCB )->uxPriority ] ), &( ( pxTCB )->xStateListItem ) );      \
+        tracePOST_MOVED_TASK_TO_READY_STATE( pxTCB )                                                            \
+    }
+#else
+    #define prvAddTaskToReadyList( pxTCB )                                                                      \
+    {                                                                                                           \
+        traceMOVED_TASK_TO_READY_STATE( pxTCB );                                                                \
+        taskRECORD_READY_PRIORITY( ( pxTCB )->uxPriority );                                                     \
+        vListInsert( &( pxReadyTasksLists[ ( pxTCB )->uxPriority ] ), &( ( pxTCB )->xStateListItem ) );         \
+        tracePOST_MOVED_TASK_TO_READY_STATE( pxTCB )                                                            \
+    }
+#endif
 /*-----------------------------------------------------------*/
 
 /*
@@ -242,6 +259,19 @@ to its original value when it is released. */
 	#define taskEVENT_LIST_ITEM_VALUE_IN_USE	0x8000U
 #else
 	#define taskEVENT_LIST_ITEM_VALUE_IN_USE	0x80000000UL
+#endif
+
+#if ( configUSE_EDF_SCHEDULER == 1)
+	// I wish I didn't have to implement it this way.
+	// But modifications to the task control block breaks compilation :(
+	/*< Stores the period of the task in ticks */
+	extern TickType_t xTaskPeriods[];
+	/*< Stores the relative deadline of the task for implicit deadline EDF scheduling in ticks */
+	extern TickType_t xTaskDeadlines[];
+	extern uint8_t xTaskType[];
+	extern const BaseType_t numberOfTasks;
+	extern BaseType_t scalingFactor;
+	TickType_t uxTaskGetDeadline( TaskHandle_t xTask);
 #endif
 
 /*
@@ -322,6 +352,11 @@ typedef struct tskTaskControlBlock 			/* The old naming convention is used to pr
 	#if( configUSE_POSIX_ERRNO == 1 )
 		int iTaskErrno;
 	#endif
+
+	// #if ( configUSE_EDF_SCHEDULER == 1)
+	// 	TickType_t xTaskPeriod;   /*< Stores the period of the task in ticks */
+	// 	TickType_t xTaskDeadline; /*< Stores the relative deadline of the task for implicit deadline EDF scheduling in ticks */
+    // #endif
 
 } tskTCB;
 
@@ -829,6 +864,7 @@ static void prvInitialiseNewTask( 	TaskFunction_t pxTaskCode,
 {
 StackType_t *pxTopOfStack;
 UBaseType_t x;
+customParameters_t *parameters;
 
 	#if( portUSING_MPU_WRAPPERS == 1 )
 		/* Should the task be created in privileged mode? */
@@ -937,6 +973,15 @@ UBaseType_t x;
 
 	vListInitialiseItem( &( pxNewTCB->xStateListItem ) );
 	vListInitialiseItem( &( pxNewTCB->xEventListItem ) );
+
+	/* Set the StateListItem value to be the absolute deadline of the task */
+    #if ( configUSE_EDF_SCHEDULER  == 1)
+		parameters = (customParameters_t *) pvParameters;
+        // pxNewTCB->xTaskPeriod = parameters->period;
+		// pxNewTCB->xTaskDeadline = parameters->deadline;
+        // listSET_LIST_ITEM_VALUE(&( ( pxNewTCB )->xStateListItem), ( TickType_t ) xTickCount + pxNewTCB->xTaskDeadline);
+		listSET_LIST_ITEM_VALUE(&( ( pxNewTCB )->xStateListItem), ( TickType_t ) xTickCount + parameters->deadline);
+    #endif
 
 	/* Set the pxNewTCB as a link back from the ListItem_t.  This is so we can get
 	back to	the containing TCB from a generic item in a list. */
@@ -2746,6 +2791,15 @@ BaseType_t xSwitchRequired = pdFALSE;
 					{
 						mtCOVERAGE_TEST_MARKER();
 					}
+
+					/* Set the new absolute deadline of the task if EDF is being used. */
+                    #if ( configUSE_EDF_SCHEDULER == 1 )
+						if (xTaskType[pxTCB->pcTaskName[12] - '0'] == 'H') {
+							listSET_LIST_ITEM_VALUE( &( ( pxTCB )->xStateListItem ), ( TickType_t ) xConstTickCount + scalingFactor * uxTaskGetDeadline(pxTCB) );
+						} else {
+							listSET_LIST_ITEM_VALUE( &( ( pxTCB )->xStateListItem ), ( TickType_t ) xConstTickCount + uxTaskGetDeadline(pxTCB) );
+						}
+                    #endif
 
 					/* Place the unblocked task into the appropriate ready
 					list. */
@@ -5212,3 +5266,27 @@ when performing module tests). */
 #endif
 
 
+
+#if ( configUSE_EDF_SCHEDULER == 1)
+
+	TickType_t uxTaskGetDeadline( TaskHandle_t xTask)
+	{
+		TCB_t const *pxTCB;
+		TickType_t uxReturn;
+		BaseType_t taskIndex;
+
+			if( xTask != NULL )
+			{
+				pxTCB = xTask;
+				taskIndex = pxTCB->pcTaskName[12] - '0';
+				uxReturn = xTaskDeadlines[taskIndex];
+			}
+			else
+			{
+				uxReturn = 0U;
+			}
+		
+		return uxReturn;
+	}
+
+#endif /* configUSE_EDF_SCHEDULER */
